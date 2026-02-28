@@ -5,7 +5,9 @@ import MetricCard from './components/MetricCard'
 import TraceTimeline from './components/TraceTimeline'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
-const STT_API_URL = 'https://ibxdsy0e40.execute-api.ap-south-1.amazonaws.com/dev/audiototranscript-api'
+const STT_API_URL =
+  import.meta.env.VITE_STT_API_URL ||
+  'https://ibxdsy0e40.execute-api.ap-south-1.amazonaws.com/dev/audiototranscript-api'
 const RUNS_STORAGE_KEY = 'agent_runs_v2'
 const ADMIN_PASSWORD = 'admin@123'
 
@@ -28,6 +30,7 @@ function parseIntent(text, medicines = []) {
   const quantity = quantityMatch ? Number(quantityMatch[1]) : 1
 
   let medicineName = ''
+  let matchedFromCatalog = false
   let bestLength = -1
   for (const med of medicines || []) {
     const name = med?.medicine_name || ''
@@ -36,6 +39,30 @@ function parseIntent(text, medicines = []) {
     if (normalizedPrompt.includes(normName) && normName.length > bestLength) {
       bestLength = normName.length
       medicineName = name
+      matchedFromCatalog = true
+    }
+  }
+
+  // Fuzzy fallback: pick the medicine with best token overlap from catalog.
+  if (!medicineName) {
+    const promptTokens = new Set(normalizedPrompt.split(' ').filter((t) => t.length > 2))
+    let bestScore = 0
+    for (const med of medicines || []) {
+      const name = med?.medicine_name || ''
+      const nameTokens = normalizeText(name).split(' ').filter((t) => t.length > 2)
+      let score = 0
+      for (const token of nameTokens) {
+        if (promptTokens.has(token)) score += 1
+      }
+      if (score > bestScore) {
+        bestScore = score
+        medicineName = name
+      }
+    }
+    if (bestScore >= 2) {
+      matchedFromCatalog = true
+    } else if (!matchedFromCatalog) {
+      medicineName = ''
     }
   }
 
@@ -52,7 +79,7 @@ function parseIntent(text, medicines = []) {
     medicineName = stripped
   }
 
-  return { quantity, medicine_name: medicineName }
+  return { quantity, medicine_name: medicineName, matchedFromCatalog }
 }
 
 function seemsLikeOrder(text) {
@@ -96,6 +123,7 @@ export default function App() {
   const [voiceTranscript, setVoiceTranscript] = useState('')
   const [voiceStatus, setVoiceStatus] = useState('Idle')
   const [isListening, setIsListening] = useState(false)
+  const [isTranscribing, setIsTranscribing] = useState(false)
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
   const audioChunksRef = useRef([])
@@ -163,34 +191,57 @@ export default function App() {
 
   const transcribeAudio = async (audioBlob) => {
     const base64 = await blobToBase64(audioBlob)
-    const payload = {
+    const payloadPrimary = {
       body: JSON.stringify({ data: base64 }),
       isBase64Encoded: false,
     }
-    const res = await fetch(STT_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    if (!res.ok) {
-      throw new Error(`STT API failed: ${res.status}`)
+
+    const callStt = async (payload) => {
+      const res = await fetch(STT_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!res.ok) {
+        throw new Error(`STT API failed: ${res.status}`)
+      }
+      const outer = await res.json()
+      const parsedBody = typeof outer.body === 'string' ? JSON.parse(outer.body) : outer.body
+      return parsedBody?.transcript || ''
     }
-    const outer = await res.json()
-    const parsedBody = typeof outer.body === 'string' ? JSON.parse(outer.body) : outer.body
-    return parsedBody?.transcript || ''
+
+    try {
+      return await callStt(payloadPrimary)
+    } catch {
+      // fallback if gateway expects direct body schema
+      return await callStt({ data: base64 })
+    }
   }
 
   const startVoiceInput = async () => {
     try {
+      setApiError('')
+      setVoiceTranscript('')
+      setIsTranscribing(false)
       if (!navigator.mediaDevices?.getUserMedia) {
         setApiError('Microphone capture is not supported in this browser.')
+        return
+      }
+      if (!window.isSecureContext) {
+        setApiError('Microphone requires secure context (https or localhost).')
+        return
+      }
+      if (typeof MediaRecorder === 'undefined') {
+        setApiError('MediaRecorder is not supported in this browser.')
         return
       }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       mediaStreamRef.current = stream
       audioChunksRef.current = []
 
-      const recorder = new MediaRecorder(stream)
+      const preferredTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+      const supportedType = preferredTypes.find((t) => MediaRecorder.isTypeSupported?.(t))
+      const recorder = supportedType ? new MediaRecorder(stream, { mimeType: supportedType }) : new MediaRecorder(stream)
       mediaRecorderRef.current = recorder
       setIsListening(true)
       setVoiceStatus('Recording...')
@@ -204,6 +255,7 @@ export default function App() {
       recorder.onstop = async () => {
         setIsListening(false)
         setVoiceStatus('Transcribing...')
+        setIsTranscribing(true)
         try {
           const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' })
           const transcript = await transcribeAudio(audioBlob)
@@ -213,6 +265,7 @@ export default function App() {
           setVoiceStatus('Transcription failed')
           setApiError(`Speech-to-text failed. ${String(err.message || err)}`)
         } finally {
+          setIsTranscribing(false)
           if (mediaStreamRef.current) {
             mediaStreamRef.current.getTracks().forEach((t) => t.stop())
             mediaStreamRef.current = null
@@ -222,19 +275,25 @@ export default function App() {
         }
       }
 
-      recorder.start()
+      recorder.start(250)
     } catch (err) {
       setIsListening(false)
       setVoiceStatus('Microphone error')
+      setIsTranscribing(false)
       setApiError(`Unable to start microphone. ${String(err.message || err)}`)
     }
   }
 
   const stopVoiceInput = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.requestData()
+      } catch {
+        // ignore
+      }
+      setVoiceStatus('Stopping...')
       mediaRecorderRef.current.stop()
     }
-    setVoiceStatus('Stopped')
   }
 
   const appendRun = (run) => {
@@ -259,6 +318,12 @@ export default function App() {
       const intent = parseIntent(userPrompt, medicines)
       const medicineName = intent.medicine_name
       const quantity = Number(intent.quantity || 1)
+      if (!intent.matchedFromCatalog) {
+        const msg = "I couldn't confidently identify one medicine from your voice text. Please say one medicine name clearly."
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+        if (speakReply) speakText(msg)
+        return
+      }
       const timeline = [{ step: 1, stage: 'IntentExtractionAgent', summary: `medicine=${medicineName}, qty=${quantity}` }]
 
       const medicine = await fetchMedicineByName(medicineName)
@@ -374,6 +439,8 @@ export default function App() {
     if (!text) return
     setChatMessages((prev) => [...prev, { role: 'user', text, ts: nowIso() }])
     await runAgentChain(text, { speakReply: true })
+    setVoiceTranscript('')
+    setVoiceStatus('Idle')
   }
 
   const onClearChat = () => {
@@ -423,6 +490,7 @@ export default function App() {
   }, [])
 
   const latestRun = runResult || runHistory[0]
+  const voiceBusy = isListening || voiceStatus === 'Transcribing...'
   const summary = useMemo(() => {
     if (!runHistory.length) return { total_runs: 0, success_rate: 0, avg_latency_ms: 0, avg_suggestion_score: 0 }
     const total = runHistory.length
@@ -533,23 +601,52 @@ export default function App() {
                     </button>
                   </div>
 
-                  <textarea value={voiceTranscript} onChange={(e) => setVoiceTranscript(e.target.value)} rows={3} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm mb-3" placeholder="Speech transcript..." />
+                  <textarea value={voiceTranscript} onChange={(e) => setVoiceTranscript(e.target.value)} rows={2} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm mb-3" placeholder="Speech transcript..." />
+                  {isTranscribing && (
+                    <p className="text-xs text-sky-700 mb-2">Transcribing audio... please wait.</p>
+                  )}
 
                   <div className="flex flex-wrap gap-2">
-                  <button onClick={startVoiceInput} className={`rounded-xl px-4 py-2 text-sm font-semibold border ${isListening ? 'bg-amber-100 border-amber-300 text-amber-900' : 'bg-white'}`}><Mic className="h-4 w-4 inline mr-1" /> {isListening ? 'Listening...' : 'Start Listening'}</button>
-                  <button onClick={stopVoiceInput} className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white">Stop</button>
-                  <button onClick={onSendVoiceTranscript} disabled={loadingRun || !voiceTranscript.trim()} className="rounded-xl bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 text-sm font-semibold disabled:opacity-50">Send Voice to AI</button>
-                  <button onClick={onClearChat} className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white">Clear Chat</button>
-                  <button onClick={() => speakText(voiceTranscript || 'Voice assistant ready')} className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white"><Volume2 className="h-4 w-4 inline mr-1" /> Test Voice</button>
-                </div>
+                    <button
+                      onClick={isListening ? stopVoiceInput : startVoiceInput}
+                      className={`rounded-xl px-4 py-2 text-sm font-semibold border ${isListening ? 'bg-amber-100 border-amber-300 text-amber-900' : 'bg-white'}`}
+                    >
+                      <Mic className="h-4 w-4 inline mr-1" /> {isListening ? 'Stop Recording' : 'Start Recording'}
+                    </button>
+                    <button
+                      onClick={onSendVoiceTranscript}
+                      disabled={loadingRun || voiceBusy || isTranscribing || !voiceTranscript.trim()}
+                      className="rounded-xl bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                    >
+                      Send Voice to AI
+                    </button>
+                    <button
+                      onClick={onClearChat}
+                      disabled={voiceBusy}
+                      className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                    >
+                      Clear Chat
+                    </button>
+                    <button
+                      onClick={() => speakText(voiceTranscript || 'Voice assistant ready')}
+                      disabled={voiceBusy}
+                      className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                    >
+                      <Volume2 className="h-4 w-4 inline mr-1" /> Test Voice
+                    </button>
+                  </div>
               </div>
 
+              </div>
+
+              <div className="lg:col-span-4 space-y-4">
+                <TraceTimeline events={latestRun?.trace_timeline || []} />
                 <div className="panel p-4">
                   <div className="flex items-center gap-2 mb-3">
                     <ShieldCheck className="h-5 w-5 text-emerald-600" />
                     <h3 className="text-lg font-semibold">Security Layers</h3>
                   </div>
-                  <div className="grid md:grid-cols-3 gap-3">
+                  <div className="space-y-3">
                     {securityLayers.map((layer) => (
                       <div key={layer.name} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
                         <div className="flex items-center justify-between">
@@ -571,10 +668,6 @@ export default function App() {
                     ))}
                   </div>
                 </div>
-              </div>
-
-              <div className="lg:col-span-4 space-y-4">
-                <TraceTimeline events={latestRun?.trace_timeline || []} />
               </div>
             </div>
           </section>
