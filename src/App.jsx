@@ -4,7 +4,7 @@ import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis
 import MetricCard from './components/MetricCard'
 import TraceTimeline from './components/TraceTimeline'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
+const API_BASE = import.meta.env.VITE_AGENT_API_URL || import.meta.env.VITE_API_BASE_URL || ''
 const STT_API_URL =
   import.meta.env.VITE_STT_API_URL ||
   'https://ibxdsy0e40.execute-api.ap-south-1.amazonaws.com/dev/audiototranscript-api'
@@ -23,65 +23,6 @@ function normalizeText(value) {
     .trim()
 }
 
-function parseIntent(text, medicines = []) {
-  const raw = (text || '').trim()
-  const normalizedPrompt = normalizeText(raw)
-  const quantityMatch = raw.match(/(\d+)/)
-  const quantity = quantityMatch ? Number(quantityMatch[1]) : 1
-
-  let medicineName = ''
-  let matchedFromCatalog = false
-  let bestLength = -1
-  for (const med of medicines || []) {
-    const name = med?.medicine_name || ''
-    const normName = normalizeText(name)
-    if (!normName) continue
-    if (normalizedPrompt.includes(normName) && normName.length > bestLength) {
-      bestLength = normName.length
-      medicineName = name
-      matchedFromCatalog = true
-    }
-  }
-
-  // Fuzzy fallback: pick the medicine with best token overlap from catalog.
-  if (!medicineName) {
-    const promptTokens = new Set(normalizedPrompt.split(' ').filter((t) => t.length > 2))
-    let bestScore = 0
-    for (const med of medicines || []) {
-      const name = med?.medicine_name || ''
-      const nameTokens = normalizeText(name).split(' ').filter((t) => t.length > 2)
-      let score = 0
-      for (const token of nameTokens) {
-        if (promptTokens.has(token)) score += 1
-      }
-      if (score > bestScore) {
-        bestScore = score
-        medicineName = name
-      }
-    }
-    if (bestScore >= 2) {
-      matchedFromCatalog = true
-    } else if (!matchedFromCatalog) {
-      medicineName = ''
-    }
-  }
-
-  if (!medicineName) {
-    const stripped = raw
-      .replace(/\d+/g, ' ')
-      .replace(/order|buy|get|need|want|please/gi, ' ')
-      .replace(/ఆర్డర్|చేయండి|కావాలి|లో/gi, ' ')
-      .replace(/ऑर्डर|करो|चाहिए/gi, ' ')
-      .replace(/ஆர்டர்|செய்யுங்கள்|வேண்டும்/gi, ' ')
-      .replace(/ಆರ್ಡರ್|ಮಾಡಿ|ಬೇಕು/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-    medicineName = stripped
-  }
-
-  return { quantity, medicine_name: medicineName, matchedFromCatalog }
-}
-
 function seemsLikeOrder(text) {
   const t = (text || '').trim().toLowerCase()
   if (!t) return false
@@ -91,15 +32,6 @@ function seemsLikeOrder(text) {
 function isGreeting(text) {
   const t = (text || '').trim().toLowerCase()
   return ['hi', 'hello', 'hey', 'namaste', 'thanks', 'thank you'].includes(t)
-}
-
-function suggestionScore(medicine, quantity, approved) {
-  if (!medicine) return 20
-  let s = 40
-  if (approved) s += 30
-  if (Number(medicine.stock || 0) >= quantity * 2) s += 20
-  if (!medicine.requires_prescription) s += 10
-  return Math.max(0, Math.min(100, s))
 }
 
 export default function App() {
@@ -124,6 +56,20 @@ export default function App() {
   const [voiceStatus, setVoiceStatus] = useState('Idle')
   const [isListening, setIsListening] = useState(false)
   const [isTranscribing, setIsTranscribing] = useState(false)
+  const [paymentBusy, setPaymentBusy] = useState(false)
+  const [invoice, setInvoice] = useState(null)
+  const [checkoutFlow, setCheckoutFlow] = useState({
+    mode: '',
+    checkoutId: '',
+    stage: 'confirm',
+    medicineName: '',
+    quantity: 0,
+    unitPrice: 0,
+    totalPrice: 0,
+    userPrompt: '',
+    traceTimeline: [],
+    suggestionScore: 0,
+  })
   const mediaRecorderRef = useRef(null)
   const mediaStreamRef = useRef(null)
   const audioChunksRef = useRef([])
@@ -160,15 +106,6 @@ export default function App() {
       throw new Error(`POST ${path} failed: ${res.status} ${txt}`)
     }
     return res.json()
-  }
-
-  const fetchMedicineByName = async (name) => {
-    ensureApiBase()
-    const res = await fetch(`${API_BASE}/medicine?medicine_name=${encodeURIComponent(name)}`)
-    if (res.status === 404) return null
-    if (!res.ok) throw new Error(`GET /medicine failed: ${res.status}`)
-    const data = await res.json()
-    return data?.found ? data : null
   }
 
   const refreshData = async () => {
@@ -301,13 +238,354 @@ export default function App() {
     setRunHistory((prev) => [run, ...prev].slice(0, 200))
   }
 
+  const resetCheckoutFlow = () => {
+    setCheckoutFlow({
+      mode: '',
+      checkoutId: '',
+      stage: '',
+      medicineName: '',
+      quantity: 0,
+      unitPrice: 0,
+      totalPrice: 0,
+      userPrompt: '',
+      traceTimeline: [],
+      suggestionScore: 0,
+    })
+  }
+
+  const extractQuantity = (text) => {
+    const m = String(text || '').match(/\b(\d+)\b/)
+    return m ? Math.max(1, Number(m[1])) : 1
+  }
+
+  const resolveMedicineName = (text) => {
+    const promptNorm = normalizeText(text)
+    let best = ''
+    let bestLen = -1
+    for (const med of medicines || []) {
+      const name = med?.medicine_name || ''
+      const norm = normalizeText(name)
+      if (!norm) continue
+      if (promptNorm.includes(norm) && norm.length > bestLen) {
+        best = name
+        bestLen = norm.length
+      }
+    }
+    if (best) return best
+
+    const promptTokens = new Set(promptNorm.split(' ').filter((t) => t.length > 2))
+    let bestScore = 0
+    let bestName = ''
+    for (const med of medicines || []) {
+      const name = med?.medicine_name || ''
+      const tokens = normalizeText(name).split(' ').filter((t) => t.length > 2)
+      let score = 0
+      for (const token of tokens) if (promptTokens.has(token)) score += 1
+      if (score > bestScore) {
+        bestScore = score
+        bestName = name
+      }
+    }
+    return bestScore >= 1 ? bestName : ''
+  }
+
+  const estimateScore = (medicine, quantity, approved) => {
+    if (!medicine) return 25
+    let s = 40
+    if (approved) s += 30
+    if (Number(medicine.stock || 0) >= quantity) s += 20
+    if (!medicine.requires_prescription) s += 10
+    return Math.max(0, Math.min(100, s))
+  }
+
+  const fetchMedicineByName = async (name) => {
+    const res = await fetch(`${API_BASE}/medicine?medicine_name=${encodeURIComponent(name)}`)
+    if (res.status === 404) return null
+    if (!res.ok) throw new Error(`GET /medicine failed: ${res.status}`)
+    const data = await res.json()
+    return data?.found === false ? null : data
+  }
+
+  const startCheckoutLocalFallback = async (userPrompt, options = {}) => {
+    const { speakReply = false } = options
+    const medicineName = resolveMedicineName(userPrompt)
+    const quantity = extractQuantity(userPrompt)
+    const timeline = [{ step: 1, stage: 'IntentExtractionAgent', summary: `medicine=${medicineName || 'UNKNOWN'}, qty=${quantity}` }]
+
+    if (!medicineName) {
+      const response = "I couldn't identify one medicine clearly. Please say one medicine name."
+      const run = {
+        run_id: crypto.randomUUID(),
+        timestamp: nowIso(),
+        user_prompt: userPrompt,
+        medicine_name: '',
+        quantity,
+        approved: false,
+        db_update_ok: false,
+        response,
+        latency_ms: 0,
+        trace_count: timeline.length + 1,
+        suggestion_score: 25,
+        trace_timeline: [...timeline, { step: 2, stage: 'SafetyPolicyAgent', summary: 'Rejected: medicine not identified' }],
+      }
+      appendRun(run)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: response, ts: nowIso() }])
+      if (speakReply) speakText(response)
+      return
+    }
+
+    const medicine = await fetchMedicineByName(medicineName)
+    if (!medicine) {
+      const response = `Medicine '${medicineName}' not found in DynamoDB.`
+      const run = {
+        run_id: crypto.randomUUID(),
+        timestamp: nowIso(),
+        user_prompt: userPrompt,
+        medicine_name: medicineName,
+        quantity,
+        approved: false,
+        db_update_ok: false,
+        response,
+        latency_ms: 0,
+        trace_count: timeline.length + 1,
+        suggestion_score: 25,
+        trace_timeline: [...timeline, { step: 2, stage: 'SafetyPolicyAgent', summary: 'Rejected: medicine not found' }],
+      }
+      appendRun(run)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: response, ts: nowIso() }])
+      if (speakReply) speakText(response)
+      return
+    }
+
+    timeline.push({ step: 2, stage: 'SafetyPolicyAgent', summary: `stock=${medicine.stock}, prescription=${medicine.requires_prescription}` })
+    if (medicine.requires_prescription) {
+      const response = `Order rejected: ${medicineName} requires prescription.`
+      const run = {
+        run_id: crypto.randomUUID(),
+        timestamp: nowIso(),
+        user_prompt: userPrompt,
+        medicine_name: medicineName,
+        quantity,
+        approved: false,
+        db_update_ok: false,
+        response,
+        latency_ms: 0,
+        trace_count: timeline.length + 1,
+        suggestion_score: estimateScore(medicine, quantity, false),
+        trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by policy' }],
+      }
+      appendRun(run)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: response, ts: nowIso() }])
+      if (speakReply) speakText(response)
+      return
+    }
+
+    if (Number(medicine.stock || 0) < quantity) {
+      const response = `Order rejected: requested ${quantity}, available ${medicine.stock}.`
+      const run = {
+        run_id: crypto.randomUUID(),
+        timestamp: nowIso(),
+        user_prompt: userPrompt,
+        medicine_name: medicineName,
+        quantity,
+        approved: false,
+        db_update_ok: false,
+        response,
+        latency_ms: 0,
+        trace_count: timeline.length + 1,
+        suggestion_score: estimateScore(medicine, quantity, false),
+        trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by stock' }],
+      }
+      appendRun(run)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: response, ts: nowIso() }])
+      if (speakReply) speakText(response)
+      return
+    }
+
+    const total = Number(medicine.price || 0) * quantity
+    setCheckoutFlow({
+      mode: 'local',
+      checkoutId: `local-${crypto.randomUUID()}`,
+      stage: 'confirm',
+      medicineName,
+      quantity,
+      unitPrice: Number(medicine.price || 0),
+      totalPrice: total,
+      userPrompt,
+      traceTimeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Awaiting user confirmation for payment' }],
+      suggestionScore: estimateScore(medicine, quantity, true),
+    })
+    const msg = `Confirm order: ${quantity} x ${medicineName}. Total cost: ${total.toFixed(2)}`
+    setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+    if (speakReply) speakText(msg)
+  }
+
+  const cancelCheckoutFlow = async () => {
+    if (!checkoutFlow.checkoutId) return
+    setPaymentBusy(true)
+    try {
+      if (checkoutFlow.mode === 'local') {
+        const trace = [...checkoutFlow.traceTimeline, { step: checkoutFlow.traceTimeline.length + 1, stage: 'SupervisorAgent', summary: 'Canceled by user' }]
+        const run = {
+          run_id: crypto.randomUUID(),
+          timestamp: nowIso(),
+          user_prompt: checkoutFlow.userPrompt,
+          medicine_name: checkoutFlow.medicineName,
+          quantity: checkoutFlow.quantity,
+          approved: false,
+          db_update_ok: false,
+          response: 'Order canceled by user.',
+          latency_ms: 0,
+          trace_count: trace.length,
+          suggestion_score: checkoutFlow.suggestionScore || 25,
+          trace_timeline: trace,
+        }
+        appendRun(run)
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
+        resetCheckoutFlow()
+        return
+      }
+      const path = checkoutFlow.stage === 'payment' ? '/checkout/pay' : '/checkout/confirm'
+      const body = checkoutFlow.stage === 'payment'
+        ? { checkout_id: checkoutFlow.checkoutId, pay: false }
+        : { checkout_id: checkoutFlow.checkoutId, confirm: false }
+      const resp = await apiPost(path, body)
+      const msg = resp?.message || 'Order canceled by user.'
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+      resetCheckoutFlow()
+    } catch (e) {
+      const msg = `Cancel failed. ${String(e.message || e)}`
+      setApiError(msg)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+    } finally {
+      setPaymentBusy(false)
+    }
+  }
+
+  const confirmCheckoutFlow = async () => {
+    if (!checkoutFlow.checkoutId || checkoutFlow.stage !== 'confirm') return
+    setPaymentBusy(true)
+    try {
+      if (checkoutFlow.mode === 'local') {
+        setCheckoutFlow((prev) => ({ ...prev, stage: 'payment' }))
+        const msg = `Proceed to payment of ${checkoutFlow.totalPrice.toFixed(2)}.`
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+        return
+      }
+      const resp = await apiPost('/checkout/confirm', { checkout_id: checkoutFlow.checkoutId, confirm: true })
+      if (resp?.status === 'PENDING_PAYMENT') {
+        setCheckoutFlow((prev) => ({
+          ...prev,
+          stage: 'payment',
+          totalPrice: Number(resp.total_price || prev.totalPrice || 0),
+        }))
+      }
+      const msg = resp?.message || 'Proceeding to payment.'
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+    } catch (e) {
+      const msg = `Confirmation failed. ${String(e.message || e)}`
+      setApiError(msg)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+    } finally {
+      setPaymentBusy(false)
+    }
+  }
+
+  const payCheckoutFlow = async () => {
+    if (!checkoutFlow.checkoutId || checkoutFlow.stage !== 'payment') return
+    setPaymentBusy(true)
+    try {
+      if (checkoutFlow.mode === 'local') {
+        const orderResp = await apiPost('/order', {
+          medicine_name: checkoutFlow.medicineName,
+          quantity: checkoutFlow.quantity,
+        })
+        const approved = orderResp?.execution_status === 'SUCCESS'
+        const trace = [
+          ...checkoutFlow.traceTimeline,
+          { step: checkoutFlow.traceTimeline.length + 1, stage: 'ActionAgent', summary: 'Calling /order' },
+          { step: checkoutFlow.traceTimeline.length + 2, stage: 'SupervisorAgent', summary: approved ? 'Committed to DynamoDB' : `Failed: ${orderResp?.reason || 'unknown'}` },
+        ]
+        const responseText = approved
+          ? `Order placed for ${checkoutFlow.quantity} ${checkoutFlow.medicineName}. Order ID: ${orderResp?.order_id || 'N/A'}.`
+          : `Order failed: ${orderResp?.reason || 'unknown reason'}`
+        const run = {
+          run_id: crypto.randomUUID(),
+          timestamp: nowIso(),
+          user_prompt: checkoutFlow.userPrompt,
+          medicine_name: checkoutFlow.medicineName,
+          quantity: checkoutFlow.quantity,
+          order_id: orderResp?.order_id || '',
+          approved,
+          db_update_ok: approved,
+          response: responseText,
+          latency_ms: 0,
+          trace_count: trace.length,
+          suggestion_score: checkoutFlow.suggestionScore || 25,
+          trace_timeline: trace,
+        }
+        appendRun(run)
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: responseText, ts: nowIso() }])
+        if (approved) {
+          setInvoice({
+            invoice_id: `INV-${String(orderResp?.order_id || crypto.randomUUID()).slice(0, 8).toUpperCase()}`,
+            order_id: orderResp?.order_id || 'N/A',
+            medicine_name: checkoutFlow.medicineName,
+            quantity: checkoutFlow.quantity,
+            unit_price: Number(checkoutFlow.unitPrice || 0),
+            total_paid: Number(checkoutFlow.totalPrice || 0),
+            paid_at: nowIso(),
+          })
+        }
+        await refreshData()
+        resetCheckoutFlow()
+        return
+      }
+      const resp = await apiPost('/checkout/pay', { checkout_id: checkoutFlow.checkoutId, pay: true })
+      const approved = resp?.status === 'PAID'
+      const responseText = resp?.message || (approved ? 'Order paid and placed.' : 'Order failed.')
+      const trace = resp?.trace_timeline || []
+      const run = {
+        run_id: crypto.randomUUID(),
+        timestamp: nowIso(),
+        user_prompt: `checkout:${checkoutFlow.checkoutId}`,
+        medicine_name: checkoutFlow.medicineName,
+        quantity: checkoutFlow.quantity,
+        order_id: resp?.order_id || '',
+        approved,
+        db_update_ok: approved,
+        response: responseText,
+        latency_ms: Number(resp?.latency_ms || 0),
+        trace_count: trace.length,
+        suggestion_score: Number(resp?.suggestion_score || 0),
+        trace_timeline: trace,
+      }
+      appendRun(run)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: responseText, ts: nowIso() }])
+      if (resp?.invoice) setInvoice(resp.invoice)
+      await refreshData()
+      resetCheckoutFlow()
+    } catch (e) {
+      const msg = `Payment failed. ${String(e.message || e)}`
+      setApiError(msg)
+      setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+    } finally {
+      setPaymentBusy(false)
+    }
+  }
+
   const runAgentChain = async (userPrompt, options = {}) => {
     const { speakReply = false } = options
     setLoadingRun(true)
     setApiError('')
-    const start = performance.now()
 
     try {
+      if (checkoutFlow.checkoutId) {
+        const msg = 'Please complete or cancel the current checkout before creating a new order.'
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
+        if (speakReply) speakText(msg)
+        return
+      }
       if (isGreeting(userPrompt) || !seemsLikeOrder(userPrompt)) {
         const msg = 'Please share medicine name and quantity so I can process it safely.'
         setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
@@ -315,107 +593,57 @@ export default function App() {
         return
       }
 
-      const intent = parseIntent(userPrompt, medicines)
-      const medicineName = intent.medicine_name
-      const quantity = Number(intent.quantity || 1)
-      if (!intent.matchedFromCatalog) {
-        const msg = "I couldn't confidently identify one medicine from your voice text. Please say one medicine name clearly."
+      let startResp = null
+      try {
+        startResp = await apiPost('/checkout/start', { prompt: userPrompt })
+      } catch (startErr) {
+        const errText = String(startErr?.message || startErr || '')
+        const fallbackNeeded =
+          errText.includes('/checkout/start') ||
+          errText.includes('404') ||
+          errText.includes('Failed to fetch') ||
+          errText.includes('ERR_FAILED')
+        if (fallbackNeeded) {
+          await startCheckoutLocalFallback(userPrompt, { speakReply })
+          return
+        }
+        throw startErr
+      }
+      const timeline = startResp?.trace_timeline || []
+      if (startResp?.status === 'REJECTED') {
+        const run = {
+          run_id: crypto.randomUUID(),
+          timestamp: nowIso(),
+          user_prompt: userPrompt,
+          medicine_name: startResp?.medicine_name || '',
+          quantity: Number(startResp?.quantity || 1),
+          approved: false,
+          db_update_ok: false,
+          response: startResp?.message || 'Order rejected.',
+          latency_ms: 0,
+          trace_count: timeline.length,
+          suggestion_score: Number(startResp?.suggestion_score || 25),
+          trace_timeline: timeline,
+        }
+        appendRun(run)
+        setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
+        if (speakReply) speakText(run.response)
+        return
+      }
+
+      if (startResp?.status === 'PENDING_CONFIRMATION') {
+        setCheckoutFlow({
+          checkoutId: startResp.checkout_id,
+          stage: 'confirm',
+          medicineName: startResp.medicine_name || '',
+          quantity: Number(startResp.quantity || 1),
+          unitPrice: Number(startResp.unit_price || 0),
+          totalPrice: Number(startResp.total_price || 0),
+        })
+        const msg = startResp?.message || 'Please confirm this order.'
         setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
         if (speakReply) speakText(msg)
-        return
       }
-      const timeline = [{ step: 1, stage: 'IntentExtractionAgent', summary: `medicine=${medicineName}, qty=${quantity}` }]
-
-      const medicine = await fetchMedicineByName(medicineName)
-      if (!medicine) {
-        const run = {
-          run_id: crypto.randomUUID(),
-          timestamp: nowIso(),
-          user_prompt: userPrompt,
-          medicine_name: medicineName,
-          quantity,
-          approved: false,
-          db_update_ok: false,
-          response: `Medicine '${medicineName}' not found in DynamoDB.`,
-          latency_ms: Math.round(performance.now() - start),
-          trace_count: 2,
-          suggestion_score: 25,
-          trace_timeline: [...timeline, { step: 2, stage: 'SafetyPolicyAgent', summary: 'Rejected: medicine not found' }],
-        }
-        appendRun(run)
-        setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
-        if (speakReply) speakText(run.response)
-        return
-      }
-
-      timeline.push({ step: 2, stage: 'SafetyPolicyAgent', summary: `stock=${medicine.stock}, prescription=${medicine.requires_prescription}` })
-
-      if (medicine.requires_prescription) {
-        const run = {
-          run_id: crypto.randomUUID(),
-          timestamp: nowIso(),
-          user_prompt: userPrompt,
-          medicine_name: medicineName,
-          quantity,
-          approved: false,
-          db_update_ok: false,
-          response: `Order rejected: ${medicineName} requires prescription.`,
-          latency_ms: Math.round(performance.now() - start),
-          trace_count: 3,
-          suggestion_score: 35,
-          trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by policy' }],
-        }
-        appendRun(run)
-        setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
-        if (speakReply) speakText(run.response)
-        return
-      }
-
-      if (Number(medicine.stock || 0) < quantity) {
-        const run = {
-          run_id: crypto.randomUUID(),
-          timestamp: nowIso(),
-          user_prompt: userPrompt,
-          medicine_name: medicineName,
-          quantity,
-          approved: false,
-          db_update_ok: false,
-          response: `Order rejected: requested ${quantity}, available ${medicine.stock}.`,
-          latency_ms: Math.round(performance.now() - start),
-          trace_count: 3,
-          suggestion_score: 45,
-          trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by stock' }],
-        }
-        appendRun(run)
-        setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
-        if (speakReply) speakText(run.response)
-        return
-      }
-
-      timeline.push({ step: 3, stage: 'ActionAgent', summary: 'Calling place_order_atomic' })
-      const orderResp = await apiPost('/order', { medicine_name: medicineName, quantity })
-      const approved = orderResp?.execution_status === 'SUCCESS'
-      const run = {
-        run_id: crypto.randomUUID(),
-        timestamp: nowIso(),
-        user_prompt: userPrompt,
-        medicine_name: medicineName,
-        quantity,
-        order_id: orderResp?.order_id || '',
-        approved,
-        db_update_ok: approved,
-        response: approved
-          ? `Order placed for ${quantity} ${medicineName}. Order ID: ${orderResp?.order_id || 'N/A'}.`
-          : `Order failed: ${orderResp?.reason || 'unknown reason'}`,
-        latency_ms: Math.round(performance.now() - start),
-        trace_count: 4,
-        suggestion_score: suggestionScore(medicine, quantity, approved),
-        trace_timeline: [...timeline, { step: 4, stage: 'SupervisorAgent', summary: approved ? 'Committed to DynamoDB' : 'Failed' }],
-      }
-      appendRun(run)
-      setChatMessages((prev) => [...prev, { role: 'assistant', text: run.response, ts: nowIso() }])
-      await refreshData()
-      if (speakReply) speakText(run.response)
     } catch (e) {
       const msg = `API not reachable or invalid response. ${String(e.message || e)}`
       setApiError(msg)
@@ -455,6 +683,8 @@ export default function App() {
     setVoiceTranscript('')
     setVoiceStatus('Idle')
     setApiError('')
+    setInvoice(null)
+    resetCheckoutFlow()
   }
 
   useEffect(() => {
@@ -635,6 +865,72 @@ export default function App() {
                       <Volume2 className="h-4 w-4 inline mr-1" /> Test Voice
                     </button>
                   </div>
+
+                  {checkoutFlow.checkoutId && (
+                    <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4">
+                      <h4 className="text-sm font-bold text-sky-900 mb-2">
+                        {checkoutFlow.stage === 'confirm' ? 'Order Confirmation' : 'Payment Required'}
+                      </h4>
+                      <div className="grid grid-cols-2 gap-2 text-xs text-sky-900 mb-3">
+                        <p><span className="font-semibold">Medicine:</span> {checkoutFlow.medicineName}</p>
+                        <p><span className="font-semibold">Quantity:</span> {checkoutFlow.quantity}</p>
+                        <p><span className="font-semibold">Unit Price:</span> {checkoutFlow.unitPrice.toFixed(2)}</p>
+                        <p><span className="font-semibold">Total:</span> {checkoutFlow.totalPrice.toFixed(2)}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {checkoutFlow.stage === 'confirm' ? (
+                          <>
+                            <button
+                              onClick={confirmCheckoutFlow}
+                              disabled={paymentBusy}
+                              className="rounded-xl px-4 py-2 text-sm font-semibold bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
+                            >
+                              {paymentBusy ? 'Processing...' : 'Confirm Order'}
+                            </button>
+                            <button
+                              onClick={cancelCheckoutFlow}
+                              disabled={paymentBusy}
+                              className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              onClick={payCheckoutFlow}
+                              disabled={paymentBusy}
+                              className="rounded-xl px-4 py-2 text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                            >
+                              {paymentBusy ? 'Processing...' : 'Pay Now'}
+                            </button>
+                            <button
+                              onClick={cancelCheckoutFlow}
+                              disabled={paymentBusy}
+                              className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {invoice && (
+                    <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+                      <h4 className="text-sm font-bold text-emerald-900 mb-2">Invoice</h4>
+                      <div className="grid grid-cols-2 gap-2 text-xs text-emerald-900">
+                        <p><span className="font-semibold">Invoice ID:</span> {invoice.invoice_id}</p>
+                        <p><span className="font-semibold">Order ID:</span> {invoice.order_id}</p>
+                        <p><span className="font-semibold">Medicine:</span> {invoice.medicine_name}</p>
+                        <p><span className="font-semibold">Quantity:</span> {invoice.quantity}</p>
+                        <p><span className="font-semibold">Unit Price:</span> {invoice.unit_price.toFixed(2)}</p>
+                        <p><span className="font-semibold">Total Paid:</span> {invoice.total_paid.toFixed(2)}</p>
+                        <p className="col-span-2"><span className="font-semibold">Paid At:</span> {invoice.paid_at}</p>
+                      </div>
+                    </div>
+                  )}
               </div>
 
               </div>
