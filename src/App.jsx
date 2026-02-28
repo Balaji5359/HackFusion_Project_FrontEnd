@@ -66,6 +66,7 @@ export default function App() {
     quantity: 0,
     unitPrice: 0,
     totalPrice: 0,
+    customerEmail: '',
     userPrompt: '',
     traceTimeline: [],
     suggestionScore: 0,
@@ -247,10 +248,29 @@ export default function App() {
       quantity: 0,
       unitPrice: 0,
       totalPrice: 0,
+      customerEmail: '',
       userPrompt: '',
       traceTimeline: [],
       suggestionScore: 0,
     })
+  }
+
+  const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim())
+
+  const dispatchInvoiceEmail = async (email, invoiceData) => {
+    try {
+      const res = await fetch(`${API_BASE}/invoice/email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          invoice: invoiceData,
+        }),
+      })
+      return res.ok
+    } catch {
+      return false
+    }
   }
 
   const extractQuantity = (text) => {
@@ -411,6 +431,7 @@ export default function App() {
       quantity,
       unitPrice: Number(medicine.price || 0),
       totalPrice: total,
+      customerEmail: '',
       userPrompt,
       traceTimeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Awaiting user confirmation for payment' }],
       suggestionScore: estimateScore(medicine, quantity, true),
@@ -468,7 +489,7 @@ export default function App() {
     try {
       if (checkoutFlow.mode === 'local') {
         setCheckoutFlow((prev) => ({ ...prev, stage: 'payment' }))
-        const msg = `Proceed to payment of ${checkoutFlow.totalPrice.toFixed(2)}.`
+        const msg = `Confirmation received. Proceed to payment of ${checkoutFlow.totalPrice.toFixed(2)}.`
         setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
         return
       }
@@ -525,17 +546,34 @@ export default function App() {
           trace_timeline: trace,
         }
         appendRun(run)
-        setChatMessages((prev) => [...prev, { role: 'assistant', text: responseText, ts: nowIso() }])
+        setChatMessages((prev) => [
+          ...prev,
+          { role: 'assistant', text: 'Payment done successfully.', ts: nowIso() },
+          { role: 'assistant', text: `Congratulations. ${responseText}`, ts: nowIso() },
+        ])
         if (approved) {
-          setInvoice({
+          const invoiceData = {
             invoice_id: `INV-${String(orderResp?.order_id || crypto.randomUUID()).slice(0, 8).toUpperCase()}`,
             order_id: orderResp?.order_id || 'N/A',
             medicine_name: checkoutFlow.medicineName,
             quantity: checkoutFlow.quantity,
             unit_price: Number(checkoutFlow.unitPrice || 0),
             total_paid: Number(checkoutFlow.totalPrice || 0),
+            customer_email: checkoutFlow.customerEmail,
             paid_at: nowIso(),
-          })
+          }
+          setInvoice(invoiceData)
+          const emailOk = await dispatchInvoiceEmail(checkoutFlow.customerEmail, invoiceData)
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              role: 'assistant',
+              text: emailOk
+                ? `Invoice sent to ${checkoutFlow.customerEmail}.`
+                : `Order placed. Invoice prepared for ${checkoutFlow.customerEmail}.`,
+              ts: nowIso(),
+            },
+          ])
         }
         await refreshData()
         resetCheckoutFlow()
@@ -561,8 +599,26 @@ export default function App() {
         trace_timeline: trace,
       }
       appendRun(run)
-      setChatMessages((prev) => [...prev, { role: 'assistant', text: responseText, ts: nowIso() }])
-      if (resp?.invoice) setInvoice(resp.invoice)
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'assistant', text: 'Payment done successfully.', ts: nowIso() },
+        { role: 'assistant', text: `Congratulations. ${responseText}`, ts: nowIso() },
+      ])
+      if (resp?.invoice) {
+        const invoiceData = { ...resp.invoice, customer_email: checkoutFlow.customerEmail }
+        setInvoice(invoiceData)
+        const emailOk = await dispatchInvoiceEmail(checkoutFlow.customerEmail, invoiceData)
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            text: emailOk
+              ? `Invoice sent to ${checkoutFlow.customerEmail}.`
+              : `Order placed. Invoice prepared for ${checkoutFlow.customerEmail}.`,
+            ts: nowIso(),
+          },
+        ])
+      }
       await refreshData()
       resetCheckoutFlow()
     } catch (e) {
@@ -866,57 +922,6 @@ export default function App() {
                     </button>
                   </div>
 
-                  {checkoutFlow.checkoutId && (
-                    <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50 p-4">
-                      <h4 className="text-sm font-bold text-sky-900 mb-2">
-                        {checkoutFlow.stage === 'confirm' ? 'Order Confirmation' : 'Payment Required'}
-                      </h4>
-                      <div className="grid grid-cols-2 gap-2 text-xs text-sky-900 mb-3">
-                        <p><span className="font-semibold">Medicine:</span> {checkoutFlow.medicineName}</p>
-                        <p><span className="font-semibold">Quantity:</span> {checkoutFlow.quantity}</p>
-                        <p><span className="font-semibold">Unit Price:</span> {checkoutFlow.unitPrice.toFixed(2)}</p>
-                        <p><span className="font-semibold">Total:</span> {checkoutFlow.totalPrice.toFixed(2)}</p>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        {checkoutFlow.stage === 'confirm' ? (
-                          <>
-                            <button
-                              onClick={confirmCheckoutFlow}
-                              disabled={paymentBusy}
-                              className="rounded-xl px-4 py-2 text-sm font-semibold bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
-                            >
-                              {paymentBusy ? 'Processing...' : 'Confirm Order'}
-                            </button>
-                            <button
-                              onClick={cancelCheckoutFlow}
-                              disabled={paymentBusy}
-                              className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
-                            >
-                              Cancel
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              onClick={payCheckoutFlow}
-                              disabled={paymentBusy}
-                              className="rounded-xl px-4 py-2 text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
-                            >
-                              {paymentBusy ? 'Processing...' : 'Pay Now'}
-                            </button>
-                            <button
-                              onClick={cancelCheckoutFlow}
-                              disabled={paymentBusy}
-                              className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
-                            >
-                              Cancel
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
                   {invoice && (
                     <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-4">
                       <h4 className="text-sm font-bold text-emerald-900 mb-2">Invoice</h4>
@@ -963,6 +968,22 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                </div>
+                <div className="panel p-4">
+                  <h3 className="text-sm font-semibold text-slate-900 mb-2">Suggestion Score Info</h3>
+                  <p className="text-xs text-slate-700 mb-2">
+                    Suggestion Score is a 0–100 confidence/quality score for the order decision.
+                  </p>
+                  <p className="text-xs text-slate-700 mb-2">
+                    In this app it reflects how safe/strong the recommendation is based on:
+                    medicine found, stock sufficiency, prescription rule, and approval/rejection outcome.
+                  </p>
+                  <p className="text-xs text-emerald-700 mb-1">
+                    Higher score = stronger confidence (typically approved + enough stock + no prescription risk).
+                  </p>
+                  <p className="text-xs text-rose-700">
+                    Lower score = weak/conflicting result (not found, low stock, rejected, etc.).
+                  </p>
                 </div>
               </div>
             </div>
@@ -1047,6 +1068,71 @@ export default function App() {
           </section>
         )}
       </div>
+
+      {checkoutFlow.checkoutId && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-[1px] flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+            <h3 className="text-lg font-bold text-slate-900 mb-1">
+              {checkoutFlow.stage === 'confirm' ? 'Confirm Order' : 'Payment'}
+            </h3>
+            <p className="text-sm text-slate-600 mb-4">
+              {checkoutFlow.stage === 'confirm'
+                ? 'Please confirm the order details.'
+                : 'Click Pay Now to complete payment and place order.'}
+            </p>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm space-y-1 mb-4">
+              <p><span className="font-semibold">Medicine:</span> {checkoutFlow.medicineName}</p>
+              <p><span className="font-semibold">Quantity:</span> {checkoutFlow.quantity}</p>
+              <p><span className="font-semibold">Unit Price:</span> {checkoutFlow.unitPrice.toFixed(2)}</p>
+              <p><span className="font-semibold">Total Price:</span> {checkoutFlow.totalPrice.toFixed(2)}</p>
+            </div>
+            <div className="flex gap-2 justify-end">
+              {checkoutFlow.stage === 'confirm' ? (
+                <>
+                  <button
+                    onClick={cancelCheckoutFlow}
+                    disabled={paymentBusy}
+                    className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                  >
+                    No
+                  </button>
+                  <button
+                    onClick={confirmCheckoutFlow}
+                    disabled={paymentBusy}
+                    className="rounded-xl px-4 py-2 text-sm font-semibold bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
+                  >
+                    {paymentBusy ? 'Processing...' : 'Yes'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <input
+                    type="email"
+                    value={checkoutFlow.customerEmail}
+                    onChange={(e) => setCheckoutFlow((prev) => ({ ...prev, customerEmail: e.target.value }))}
+                    className="flex-1 min-w-[210px] rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                    placeholder="Enter email for invoice"
+                  />
+                  <button
+                    onClick={cancelCheckoutFlow}
+                    disabled={paymentBusy}
+                    className="rounded-xl px-4 py-2 text-sm font-semibold border bg-white disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={payCheckoutFlow}
+                    disabled={paymentBusy || !isValidEmail(checkoutFlow.customerEmail)}
+                    className="rounded-xl px-4 py-2 text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {paymentBusy ? 'Processing...' : 'Pay Now'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   )
