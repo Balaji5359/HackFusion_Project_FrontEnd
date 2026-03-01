@@ -58,6 +58,12 @@ export default function App() {
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [paymentBusy, setPaymentBusy] = useState(false)
   const [invoice, setInvoice] = useState(null)
+  const [prescriptionRequired, setPrescriptionRequired] = useState(false)
+  const [prescriptionUploaded, setPrescriptionUploaded] = useState(false)
+  const [prescriptionFileName, setPrescriptionFileName] = useState('')
+  const [prescriptionPendingMedicine, setPrescriptionPendingMedicine] = useState('')
+  const [prescriptionUploadedForMedicine, setPrescriptionUploadedForMedicine] = useState('')
+  const [prescriptionPendingOrder, setPrescriptionPendingOrder] = useState(null)
   const [checkoutFlow, setCheckoutFlow] = useState({
     mode: '',
     checkoutId: '',
@@ -67,6 +73,7 @@ export default function App() {
     unitPrice: 0,
     totalPrice: 0,
     customerEmail: '',
+    startedAtMs: 0,
     userPrompt: '',
     traceTimeline: [],
     suggestionScore: 0,
@@ -75,6 +82,7 @@ export default function App() {
   const mediaStreamRef = useRef(null)
   const audioChunksRef = useRef([])
   const chatScrollRef = useRef(null)
+  const prescriptionInputRef = useRef(null)
 
   const ensureApiBase = () => {
     if (!API_BASE) throw new Error('Set VITE_API_BASE_URL in react-ui/.env.local')
@@ -249,28 +257,17 @@ export default function App() {
       unitPrice: 0,
       totalPrice: 0,
       customerEmail: '',
+      startedAtMs: 0,
       userPrompt: '',
       traceTimeline: [],
       suggestionScore: 0,
     })
   }
 
-  const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim())
-
-  const dispatchInvoiceEmail = async (email, invoiceData) => {
-    try {
-      const res = await fetch(`${API_BASE}/invoice/email`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email,
-          invoice: invoiceData,
-        }),
-      })
-      return res.ok
-    } catch {
-      return false
-    }
+  const isPrescriptionSatisfiedFor = (medicineName) => {
+    if (!prescriptionUploaded) return false
+    if (!prescriptionUploadedForMedicine) return false
+    return normalizeText(prescriptionUploadedForMedicine) === normalizeText(medicineName || '')
   }
 
   const extractQuantity = (text) => {
@@ -343,7 +340,7 @@ export default function App() {
         approved: false,
         db_update_ok: false,
         response,
-        latency_ms: 0,
+        latency_ms: 1,
         trace_count: timeline.length + 1,
         suggestion_score: 25,
         trace_timeline: [...timeline, { step: 2, stage: 'SafetyPolicyAgent', summary: 'Rejected: medicine not identified' }],
@@ -366,7 +363,7 @@ export default function App() {
         approved: false,
         db_update_ok: false,
         response,
-        latency_ms: 0,
+        latency_ms: 1,
         trace_count: timeline.length + 1,
         suggestion_score: 25,
         trace_timeline: [...timeline, { step: 2, stage: 'SafetyPolicyAgent', summary: 'Rejected: medicine not found' }],
@@ -378,8 +375,15 @@ export default function App() {
     }
 
     timeline.push({ step: 2, stage: 'SafetyPolicyAgent', summary: `stock=${medicine.stock}, prescription=${medicine.requires_prescription}` })
-    if (medicine.requires_prescription) {
-      const response = `Order rejected: ${medicineName} requires prescription.`
+    if (medicine.requires_prescription && !isPrescriptionSatisfiedFor(medicineName)) {
+      setPrescriptionRequired(true)
+      setPrescriptionPendingMedicine(medicineName)
+      setPrescriptionPendingOrder({
+        medicineName,
+        quantity,
+        userPrompt,
+      })
+      const response = `${medicineName} requires prescription. Please upload prescription to continue.`
       const run = {
         run_id: crypto.randomUUID(),
         timestamp: nowIso(),
@@ -389,16 +393,19 @@ export default function App() {
         approved: false,
         db_update_ok: false,
         response,
-        latency_ms: 0,
+        latency_ms: 1,
         trace_count: timeline.length + 1,
         suggestion_score: estimateScore(medicine, quantity, false),
-        trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by policy' }],
+        trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Prescription required: waiting for upload' }],
       }
       appendRun(run)
       setChatMessages((prev) => [...prev, { role: 'assistant', text: response, ts: nowIso() }])
       if (speakReply) speakText(response)
       return
     }
+    setPrescriptionRequired(false)
+    setPrescriptionPendingMedicine('')
+    setPrescriptionPendingOrder(null)
 
     if (Number(medicine.stock || 0) < quantity) {
       const response = `Order rejected: requested ${quantity}, available ${medicine.stock}.`
@@ -411,7 +418,7 @@ export default function App() {
         approved: false,
         db_update_ok: false,
         response,
-        latency_ms: 0,
+        latency_ms: 1,
         trace_count: timeline.length + 1,
         suggestion_score: estimateScore(medicine, quantity, false),
         trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Rejected by stock' }],
@@ -432,9 +439,24 @@ export default function App() {
       unitPrice: Number(medicine.price || 0),
       totalPrice: total,
       customerEmail: '',
+      startedAtMs: performance.now(),
       userPrompt,
       traceTimeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Awaiting user confirmation for payment' }],
       suggestionScore: estimateScore(medicine, quantity, true),
+    })
+    setRunResult({
+      run_id: `pending-${crypto.randomUUID()}`,
+      timestamp: nowIso(),
+      user_prompt: userPrompt,
+      medicine_name: medicineName,
+      quantity,
+      approved: false,
+      db_update_ok: false,
+      response: 'Pending confirmation',
+      latency_ms: 1,
+      trace_count: 3,
+      suggestion_score: estimateScore(medicine, quantity, true),
+      trace_timeline: [...timeline, { step: 3, stage: 'SupervisorAgent', summary: 'Awaiting user confirmation for payment' }],
     })
     const msg = `Confirm order: ${quantity} x ${medicineName}. Total cost: ${total.toFixed(2)}`
     setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
@@ -456,7 +478,7 @@ export default function App() {
           approved: false,
           db_update_ok: false,
           response: 'Order canceled by user.',
-          latency_ms: 0,
+          latency_ms: Math.max(1, Math.round(performance.now() - Number(checkoutFlow.startedAtMs || performance.now()))),
           trace_count: trace.length,
           suggestion_score: checkoutFlow.suggestionScore || 25,
           trace_timeline: trace,
@@ -540,7 +562,7 @@ export default function App() {
           approved,
           db_update_ok: approved,
           response: responseText,
-          latency_ms: 0,
+          latency_ms: Math.max(1, Math.round(performance.now() - Number(checkoutFlow.startedAtMs || performance.now()))),
           trace_count: trace.length,
           suggestion_score: checkoutFlow.suggestionScore || 25,
           trace_timeline: trace,
@@ -552,28 +574,15 @@ export default function App() {
           { role: 'assistant', text: `Congratulations. ${responseText}`, ts: nowIso() },
         ])
         if (approved) {
-          const invoiceData = {
+          setInvoice({
             invoice_id: `INV-${String(orderResp?.order_id || crypto.randomUUID()).slice(0, 8).toUpperCase()}`,
             order_id: orderResp?.order_id || 'N/A',
             medicine_name: checkoutFlow.medicineName,
             quantity: checkoutFlow.quantity,
             unit_price: Number(checkoutFlow.unitPrice || 0),
             total_paid: Number(checkoutFlow.totalPrice || 0),
-            customer_email: checkoutFlow.customerEmail,
             paid_at: nowIso(),
-          }
-          setInvoice(invoiceData)
-          const emailOk = await dispatchInvoiceEmail(checkoutFlow.customerEmail, invoiceData)
-          setChatMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              text: emailOk
-                ? `Invoice sent to ${checkoutFlow.customerEmail}.`
-                : `Order placed. Invoice prepared for ${checkoutFlow.customerEmail}.`,
-              ts: nowIso(),
-            },
-          ])
+          })
         }
         await refreshData()
         resetCheckoutFlow()
@@ -605,19 +614,7 @@ export default function App() {
         { role: 'assistant', text: `Congratulations. ${responseText}`, ts: nowIso() },
       ])
       if (resp?.invoice) {
-        const invoiceData = { ...resp.invoice, customer_email: checkoutFlow.customerEmail }
-        setInvoice(invoiceData)
-        const emailOk = await dispatchInvoiceEmail(checkoutFlow.customerEmail, invoiceData)
-        setChatMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            text: emailOk
-              ? `Invoice sent to ${checkoutFlow.customerEmail}.`
-              : `Order placed. Invoice prepared for ${checkoutFlow.customerEmail}.`,
-            ts: nowIso(),
-          },
-        ])
+        setInvoice(resp.invoice)
       }
       await refreshData()
       resetCheckoutFlow()
@@ -667,6 +664,21 @@ export default function App() {
       }
       const timeline = startResp?.trace_timeline || []
       if (startResp?.status === 'REJECTED') {
+        const needsRx = String(startResp?.message || '').toLowerCase().includes('requires prescription')
+        if (needsRx) {
+          setPrescriptionRequired(true)
+          if (startResp?.medicine_name) {
+            setPrescriptionPendingMedicine(startResp.medicine_name)
+            setPrescriptionPendingOrder({
+              medicineName: startResp.medicine_name,
+              quantity: Number(startResp?.quantity || 1),
+              userPrompt,
+            })
+          }
+        }
+        const rejectionResponse = needsRx
+          ? `${startResp?.medicine_name || 'This medicine'} requires prescription. Please upload prescription to continue.`
+          : (startResp?.message || 'Order rejected.')
         const run = {
           run_id: crypto.randomUUID(),
           timestamp: nowIso(),
@@ -675,7 +687,7 @@ export default function App() {
           quantity: Number(startResp?.quantity || 1),
           approved: false,
           db_update_ok: false,
-          response: startResp?.message || 'Order rejected.',
+          response: rejectionResponse,
           latency_ms: 0,
           trace_count: timeline.length,
           suggestion_score: Number(startResp?.suggestion_score || 25),
@@ -691,10 +703,30 @@ export default function App() {
         setCheckoutFlow({
           checkoutId: startResp.checkout_id,
           stage: 'confirm',
+          mode: 'backend',
           medicineName: startResp.medicine_name || '',
           quantity: Number(startResp.quantity || 1),
           unitPrice: Number(startResp.unit_price || 0),
           totalPrice: Number(startResp.total_price || 0),
+          customerEmail: '',
+          startedAtMs: performance.now(),
+          userPrompt,
+          traceTimeline: timeline,
+          suggestionScore: Number(startResp?.suggestion_score || 0),
+        })
+        setRunResult({
+          run_id: `pending-${startResp.checkout_id || crypto.randomUUID()}`,
+          timestamp: nowIso(),
+          user_prompt: userPrompt,
+          medicine_name: startResp.medicine_name || '',
+          quantity: Number(startResp.quantity || 1),
+          approved: false,
+          db_update_ok: false,
+          response: 'Pending confirmation',
+          latency_ms: Math.max(1, Number(startResp?.latency_ms || 1)),
+          trace_count: timeline.length || 3,
+          suggestion_score: Number(startResp?.suggestion_score || 0),
+          trace_timeline: timeline,
         })
         const msg = startResp?.message || 'Please confirm this order.'
         setChatMessages((prev) => [...prev, { role: 'assistant', text: msg, ts: nowIso() }])
@@ -740,7 +772,88 @@ export default function App() {
     setVoiceStatus('Idle')
     setApiError('')
     setInvoice(null)
+    setPrescriptionRequired(false)
+    setPrescriptionUploaded(false)
+    setPrescriptionFileName('')
+    setPrescriptionPendingMedicine('')
+    setPrescriptionUploadedForMedicine('')
+    setPrescriptionPendingOrder(null)
     resetCheckoutFlow()
+  }
+
+  const onUploadPrescription = async (event) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setPrescriptionUploaded(true)
+    setPrescriptionRequired(false)
+    setPrescriptionFileName(file.name)
+    setPrescriptionUploadedForMedicine(prescriptionPendingMedicine || '')
+    let msg = prescriptionPendingMedicine
+      ? `Prescription uploaded and verified for ${prescriptionPendingMedicine}: ${file.name}.`
+      : `Prescription uploaded: ${file.name}.`
+
+    if (prescriptionPendingOrder?.medicineName && prescriptionPendingOrder?.quantity) {
+      try {
+        const medicineName = prescriptionPendingOrder.medicineName
+        const qty = Number(prescriptionPendingOrder.quantity || 1)
+        const med = await fetchMedicineByName(medicineName)
+        if (!med) {
+          msg += ' Could not find medicine now.'
+        } else if (Number(med.stock || 0) < qty) {
+          msg += ` Stock changed. Requested ${qty}, available ${med.stock}.`
+        } else {
+          const timeline = [
+            { step: 1, stage: 'IntentExtractionAgent', summary: `medicine=${medicineName}, qty=${qty}` },
+            { step: 2, stage: 'SafetyPolicyAgent', summary: `stock=${med.stock}, prescription=true (uploaded)` },
+            { step: 3, stage: 'SupervisorAgent', summary: 'Awaiting user confirmation for payment' },
+          ]
+          const total = Number(med.price || 0) * qty
+          const checkoutId = `local-${crypto.randomUUID()}`
+          setCheckoutFlow({
+            mode: 'local',
+            checkoutId,
+            stage: 'confirm',
+            medicineName,
+            quantity: qty,
+            unitPrice: Number(med.price || 0),
+            totalPrice: total,
+            customerEmail: '',
+            startedAtMs: performance.now(),
+            userPrompt: prescriptionPendingOrder.userPrompt || '',
+            traceTimeline: timeline,
+            suggestionScore: estimateScore(med, qty, true),
+          })
+          setRunResult({
+            run_id: `pending-${checkoutId}`,
+            timestamp: nowIso(),
+            user_prompt: prescriptionPendingOrder.userPrompt || '',
+            medicine_name: medicineName,
+            quantity: qty,
+            approved: false,
+            db_update_ok: false,
+            response: 'Pending confirmation',
+            latency_ms: 1,
+            trace_count: timeline.length,
+            suggestion_score: estimateScore(med, qty, true),
+            trace_timeline: timeline,
+          })
+          msg += ` Proceeding to confirmation for ${qty} x ${medicineName}. Total cost: ${total.toFixed(2)}`
+          setPrescriptionPendingOrder(null)
+          setPrescriptionPendingMedicine('')
+        }
+      } catch {
+        msg += ' Unable to auto-continue. Please retry.'
+      }
+    }
+
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        role: 'assistant',
+        text: msg,
+        ts: nowIso(),
+      },
+    ])
   }
 
   useEffect(() => {
@@ -885,7 +998,24 @@ export default function App() {
                     <button onClick={onSendPrompt} disabled={loadingRun} className="rounded-xl bg-sky-600 hover:bg-sky-700 text-white px-4 py-3 text-sm font-semibold disabled:opacity-50">
                       {loadingRun ? 'Running...' : 'Send'}
                     </button>
+                    <button
+                      onClick={() => prescriptionInputRef.current?.click()}
+                      disabled={!prescriptionRequired}
+                      className="rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Upload Rx
+                    </button>
+                    <input
+                      ref={prescriptionInputRef}
+                      type="file"
+                      accept=".pdf,.png,.jpg,.jpeg,.webp"
+                      onChange={onUploadPrescription}
+                      className="hidden"
+                    />
                   </div>
+                  {prescriptionFileName && (
+                    <p className="text-xs text-emerald-700 mb-2">Prescription file: {prescriptionFileName}</p>
+                  )}
 
                   <textarea value={voiceTranscript} onChange={(e) => setVoiceTranscript(e.target.value)} rows={2} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm mb-3" placeholder="Speech transcript..." />
                   {isTranscribing && (
@@ -1111,7 +1241,7 @@ export default function App() {
                     value={checkoutFlow.customerEmail}
                     onChange={(e) => setCheckoutFlow((prev) => ({ ...prev, customerEmail: e.target.value }))}
                     className="flex-1 min-w-[210px] rounded-xl border border-slate-300 px-3 py-2 text-sm"
-                    placeholder="Enter email for invoice"
+                    placeholder="Enter Gmail (optional)"
                   />
                   <button
                     onClick={cancelCheckoutFlow}
@@ -1122,7 +1252,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={payCheckoutFlow}
-                    disabled={paymentBusy || !isValidEmail(checkoutFlow.customerEmail)}
+                    disabled={paymentBusy}
                     className="rounded-xl px-4 py-2 text-sm font-semibold bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
                   >
                     {paymentBusy ? 'Processing...' : 'Pay Now'}
